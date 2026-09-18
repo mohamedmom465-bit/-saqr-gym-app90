@@ -8,12 +8,19 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # تثبيت نسخة Flutter بالظبط بدل "stable" المتغيرة - يمنع مفاجآت
-      # من تحديثات Flutter المستقبلية اللي ممكن تكسر البيلد فجأة
+      # JDK 17 ثابت (مطلوب لـ AGP 9) بدل الاعتماد على الافتراضي بتاع الـ runner
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # نسخة Flutter ثابتة بدل "stable" المتغيرة - يمنع مفاجآت التحديثات
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -21,29 +28,81 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Flutter version info
+        run: |
+          flutter --version
+          java -version
+
+      # --project-name ثابت: اسم الفولدر على GitHub فيه "-" في الأول
+      # وده مش اسم Dart package صالح
       - name: Generate Android platform project (only if not already committed)
         run: |
           if [ ! -d android ]; then
-            flutter create --platforms=android .
+            flutter create --platforms=android --project-name saqr_gym .
           else
             echo "android/ already exists in the repo - using the committed version."
           fi
 
+      # ------------------------------------------------------------------
+      # gradle.properties
+      # قالب Flutter 3.47.4 بيحط android.newDsl=false و android.builtInKotlin=false
+      # (عشان البلجنز اللي لسه بتستخدم Kotlin plugin القديم). مش بنغيّرهم،
+      # بنتأكد بس إنهم موجودين. ومبنكتبش سطر مكرر لأي property.
+      # ------------------------------------------------------------------
+      - name: Configure gradle.properties
+        run: |
+          F=android/gradle.properties
+          touch "$F"
+          # نتأكد إن الملف بينتهي بسطر جديد قبل ما نضيف عليه
+          if [ -n "$(tail -c1 "$F")" ]; then echo >> "$F"; fi
+
+          set_prop() {  # يمسح أي قيمة قديمة ويكتب القيمة الجديدة
+            sed -i "/^$1=/d" "$F"
+            echo "$1=$2" >> "$F"
+          }
+          ensure_prop() {  # يكتب القيمة بس لو مش موجودة أصلاً
+            grep -q "^$1=" "$F" || echo "$1=$2" >> "$F"
+          }
+
+          # ذاكرة Gradle: 4GB مناسبة لـ runner فيه 7GB (القالب بيحط 8GB وممكن يتقتل)
+          set_prop org.gradle.jvmargs "-Xmx4g -XX:MaxMetaspaceSize=2g -XX:+HeapDumpOnOutOfMemoryError"
+          # مهلة أطول لتحميل المكتبات (بيمنع فشل عشوائي بسبب بطء الشبكة)
+          set_prop systemProp.org.gradle.internal.http.connectionTimeout 60000
+          set_prop systemProp.org.gradle.internal.http.socketTimeout 60000
+          # يمنع فشل "Inconsistent JVM Target" (يخليه تحذير بس)
+          set_prop kotlin.jvm.target.validation.mode warning
+
+          ensure_prop android.useAndroidX true
+          ensure_prop android.newDsl false
+          ensure_prop android.builtInKotlin false
+
+      # ------------------------------------------------------------------
+      # قواعد R8/ProGuard: من غيرها flutter_local_notifications (Gson) بيتعطل
+      # في نسخة الـ release وقت جدولة التذكيرات
+      # ------------------------------------------------------------------
+      - name: Add ProGuard rules
+        run: |
+          cat > android/app/proguard-rules.pro << 'EOF'
+          # flutter_local_notifications (Gson generics)
+          -keepattributes Signature
+          -keepattributes *Annotation*
+          -keep class com.google.gson.reflect.TypeToken { *; }
+          -keep class * extends com.google.gson.reflect.TypeToken
+          -keep class com.dexterous.flutterlocalnotifications.models.** { *; }
+          # مكتبات اختيارية مش موجودة - يمنع فشل R8 "Missing classes"
+          -dontwarn com.google.android.play.core.**
+          -dontwarn javax.annotation.**
+          EOF
+
+      # ------------------------------------------------------------------
+      # إعدادات تطبيق الـ app (android/app/build.gradle.kts)
+      # ------------------------------------------------------------------
       - name: Patch app-level Android settings
         run: |
           if grep -q "compileSdk = 36" android/app/build.gradle.kts 2>/dev/null; then
             echo "Android settings already patched (committed android/ folder) - skipping."
             exit 0
           fi
-          # 1) توحيد نسخة Java/Kotlin - يمنع Inconsistent JVM Target
-          echo "kotlin.jvm.target.validation.mode=warning" >> android/gradle.properties
-
-          # 2) زيادة ذاكرة Gradle - يمنع Out Of Memory وقت البناء
-          echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=2g" >> android/gradle.properties
-
-          # 3) تفعيل AndroidX/Jetifier - مطلوب لمعظم البلجنز الحديثة
-          echo "android.useAndroidX=true" >> android/gradle.properties
-          echo "android.enableJetifier=true" >> android/gradle.properties
 
           cat >> android/app/build.gradle.kts << 'EOF'
 
@@ -56,17 +115,27 @@ jobs:
               }
 
               compileOptions {
+                  // مطلوب لـ flutter_local_notifications
                   isCoreLibraryDesugaringEnabled = true
               }
 
-              // يمنع فشل البيلد بسبب تحذيرات Lint (زي unused resources، deprecated APIs)
+              buildTypes {
+                  release {
+                      // تعطيل R8 يمنع فئة كاملة من الأعطال (Missing classes / كراش وقت التشغيل)
+                      // على حساب حجم APK أكبر شوية
+                      isMinifyEnabled = false
+                      isShrinkResources = false
+                      proguardFiles("proguard-rules.pro")
+                  }
+              }
+
+              // يمنع فشل البيلد بسبب تحذيرات Lint
               lint {
                   checkReleaseBuilds = false
                   abortOnError = false
               }
 
-              // يمنع "Duplicate class" / "More than one file was found with OS independent path"
-              // وهو خطأ شائع جدًا لما يكون عندك أكتر من مكتبة بتجيب نفس ملفات .so أو META-INF
+              // يمنع "More than one file was found with OS independent path"
               packaging {
                   resources {
                       excludes += setOf(
@@ -74,10 +143,9 @@ jobs:
                           "META-INF/LGPL2.1",
                           "META-INF/*.kotlin_module"
                       )
-                      pickFirsts += setOf(
-                          "**/libc++_shared.so",
-                          "**/libjsc.so"
-                      )
+                  }
+                  jniLibs {
+                      pickFirsts += setOf("**/libc++_shared.so")
                   }
               }
           }
@@ -88,45 +156,59 @@ jobs:
           }
           EOF
 
-      - name: Unify Android SDK/NDK/JVM across ALL plugin modules (root cause fix)
+      # ------------------------------------------------------------------
+      # توحيد compileSdk/ndk/namespace على كل بلجنز الـ Flutter (اختياري)
+      #
+      # لماذا finalizeDsl وليس android { } مباشرة؟
+      #  - AGP 9 شال الكلاسات القديمة (BaseAppModuleExtension)
+      #  - finalizeDsl بيشتغل بعد ما ملف build.gradle بتاع كل بلجن يخلص،
+      #    فقيمنا هي اللي بتكسب
+      #
+      # لماذا مش على الـ app؟
+      #  - قالب Flutter بيعمل evaluationDependsOn(":app") فالـ app بيتقيَّم قبل
+      #    الكود ده، وfinalizeDsl ساعتها بيرمي "too late". الـ app اتظبط فوق.
+      #
+      # الكود محاط بعلامات SAQR_HOOK: لو فشل، خطوة البيلد بتشيله وتعيد المحاولة.
+      # ------------------------------------------------------------------
+      - name: Unify Android SDK/NDK/namespace across plugin modules
         run: |
-          if grep -q 'plugins.withId("com.android.library")' android/build.gradle.kts 2>/dev/null; then
-            echo "Root-level unification already applied (committed android/ folder) - skipping."
+          if grep -q 'SAQR_HOOK_BEGIN' android/build.gradle.kts 2>/dev/null; then
+            echo "Root-level unification already applied - skipping."
             exit 0
           fi
-          # المشكلة الجذرية: كل plugin (مكتبة) بيجيله ملف build.gradle خاص بيه،
-          # وممكن يكون متظبط على رقم SDK/NDK/Java قديم أو مختلف عن باقي المشروع.
-          # ده اللي بيسبب أغلب الأخطاء المتكررة (checkReleaseAarMetadata،
-          # Inconsistent JVM target، إلخ) حتى لو إعدادات تطبيقك أنت مظبوطة.
-          #
-          # السطور دي بتوحّد الإعدادات دي على كل المكتبات مرة واحدة،
-          # باستخدام plugins.withId بدل afterEvaluate عشان تشتغل مهما كان
-          # توقيت تقييم كل مشروع فرعي (يتجنب خطأ "already evaluated").
           cat >> android/build.gradle.kts << 'EOF'
 
+          // SAQR_HOOK_BEGIN
           subprojects {
-              plugins.withId("com.android.library") {
-                  extensions.configure(com.android.build.gradle.LibraryExtension::class.java) {
-                      compileSdk = 36
-                      ndkVersion = "28.2.13676358"
+              val subproject = this
+              subproject.plugins.withId("com.android.library") {
+                  // لو المشروع اتقيّم خلاص، الوقت فات - نسيبه زي ما هو
+                  if (!subproject.state.executed) {
+                      try {
+                          subproject.extensions.configure(com.android.build.api.variant.LibraryAndroidComponentsExtension::class.java) {
+                              finalizeDsl { ext ->
+                                  ext.compileSdk = 36
+                                  ext.ndkVersion = "28.2.13676358"
+                                  // بلجنز قديمة من غير namespace: بنقراه من الـ Manifest
+                                  if (ext.namespace == null) {
+                                      val manifest = subproject.file("src/main/AndroidManifest.xml")
+                                      if (manifest.exists()) {
+                                          val pkg = Regex("package\\s*=\\s*\"([^\"]+)\"")
+                                              .find(manifest.readText())?.groupValues?.get(1)
+                                          if (pkg != null) {
+                                              ext.namespace = pkg
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+                      } catch (e: Exception) {
+                          subproject.logger.warn("SAQR: skipped unification for " + subproject.name + ": " + e.message)
+                      }
                   }
-              }
-              plugins.withId("com.android.application") {
-                  extensions.configure(com.android.build.gradle.BaseAppModuleExtension::class.java) {
-                      compileSdk = 36
-                      ndkVersion = "28.2.13676358"
-                  }
-              }
-              plugins.withId("org.jetbrains.kotlin.android") {
-                  extensions.configure(org.jetbrains.kotlin.gradle.dsl.KotlinAndroidProjectExtension::class.java) {
-                      jvmToolchain(17)
-                  }
-              }
-              tasks.withType(JavaCompile::class.java).configureEach {
-                  sourceCompatibility = "17"
-                  targetCompatibility = "17"
               }
           }
+          // SAQR_HOOK_END
           EOF
 
       - name: Configure AndroidManifest (notifications permissions + receivers + app name)
@@ -136,13 +218,13 @@ jobs:
           p = 'android/app/src/main/AndroidManifest.xml'
           m = open(p, encoding='utf-8').read()
 
-          # صلاحيات لازمة للتذكيرات (Android 13+) وإعادة الجدولة بعد الريستارت
+          # صلاحيات التذكيرات (Android 13+) وإعادة الجدولة بعد الريستارت
           for perm in ['POST_NOTIFICATIONS', 'RECEIVE_BOOT_COMPLETED', 'VIBRATE', 'WAKE_LOCK']:
               tag = 'android.permission.' + perm
               if tag not in m:
                   m = re.sub(r'(<manifest[^>]*>)', r'\1\n    <uses-permission android:name="' + tag + '" />', m, count=1)
 
-          # Receivers بتاعة flutter_local_notifications (من غيرها الإشعارات المجدولة والأزرار مبتشتغلش)
+          # Receivers بتاعة flutter_local_notifications
           if 'ScheduledNotificationReceiver' not in m:
               receivers = """
               <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationReceiver" />
@@ -166,22 +248,34 @@ jobs:
       - name: Get packages
         run: flutter pub get
 
-      # أيقونة التطبيق (من assets/brand) بدل أيقونة Flutter الافتراضية
+      # أيقونة التطبيق (مش هتفشل البيلد لو حصلت مشكلة)
       - name: Generate launcher icons
         run: |
-          # مفيش مجلد ios في الـ CI فبنقفل توليد أيقونات iOS عشان الأداة متفشلش
           sed -i 's/^  ios: true/  ios: false/' pubspec.yaml
           dart run flutter_launcher_icons || echo "launcher icons step failed - continuing with default icon"
 
       - name: Generate Drift code
         run: dart run build_runner build --delete-conflicting-outputs
 
-      # مايفشلش الـ build بسبب ملاحظات info/warning تجميلية
       - name: Analyze (non-blocking)
         run: flutter analyze || true
 
+      # طباعة ملفات Gradle النهائية في اللوج - لو حصل أي خطأ يبقى السياق قدامك
+      - name: Show final Gradle config
+        run: |
+          for f in android/gradle.properties android/build.gradle.kts android/app/build.gradle.kts; do
+            echo "=================== $f ==================="
+            cat "$f"
+          done
+
+      # المحاولة 1: بالتوحيد الكامل. لو فشلت (شبكة/توحيد): المحاولة 2 من غير كود التوحيد
       - name: Build release APK
-        run: flutter build apk --release
+        run: |
+          if ! flutter build apk --release; then
+            echo "::warning::Build failed - retrying without the optional unification hook"
+            sed -i '/SAQR_HOOK_BEGIN/,/SAQR_HOOK_END/d' android/build.gradle.kts
+            flutter build apk --release
+          fi
 
       - name: Upload APK
         if: success()
@@ -190,13 +284,18 @@ jobs:
           name: saqr-gym-apk
           path: build/app/outputs/flutter-apk/app-release.apk
 
-      # لو فشل أي حاجة تانية، نرفع اللوجز عشان تبصلها بسهولة من غير
-      # ما تدور في الـ Actions tab
-      - name: Upload logs on failure
+      # لو فشل: نرفع ملفات الإعداد النهائية وتقارير Gradle للتشخيص
+      - name: Upload diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs
+          name: build-diagnostics
           path: |
+            android/gradle.properties
+            android/build.gradle.kts
+            android/settings.gradle.kts
+            android/app/build.gradle.kts
+            android/app/src/main/AndroidManifest.xml
+            build/reports/**
             build/**/*.log
           if-no-files-found: ignore
