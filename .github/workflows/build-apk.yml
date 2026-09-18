@@ -1,0 +1,202 @@
+name: Build SAQR GYM APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # تثبيت نسخة Flutter بالظبط بدل "stable" المتغيرة - يمنع مفاجآت
+      # من تحديثات Flutter المستقبلية اللي ممكن تكسر البيلد فجأة
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.4'
+          channel: stable
+          cache: true
+
+      - name: Generate Android platform project (only if not already committed)
+        run: |
+          if [ ! -d android ]; then
+            flutter create --platforms=android .
+          else
+            echo "android/ already exists in the repo - using the committed version."
+          fi
+
+      - name: Patch app-level Android settings
+        run: |
+          if grep -q "compileSdk = 36" android/app/build.gradle.kts 2>/dev/null; then
+            echo "Android settings already patched (committed android/ folder) - skipping."
+            exit 0
+          fi
+          # 1) توحيد نسخة Java/Kotlin - يمنع Inconsistent JVM Target
+          echo "kotlin.jvm.target.validation.mode=warning" >> android/gradle.properties
+
+          # 2) زيادة ذاكرة Gradle - يمنع Out Of Memory وقت البناء
+          echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=2g" >> android/gradle.properties
+
+          # 3) تفعيل AndroidX/Jetifier - مطلوب لمعظم البلجنز الحديثة
+          echo "android.useAndroidX=true" >> android/gradle.properties
+          echo "android.enableJetifier=true" >> android/gradle.properties
+
+          cat >> android/app/build.gradle.kts << 'EOF'
+
+          android {
+              compileSdk = 36
+              ndkVersion = "28.2.13676358"
+
+              defaultConfig {
+                  multiDexEnabled = true
+              }
+
+              compileOptions {
+                  isCoreLibraryDesugaringEnabled = true
+              }
+
+              // يمنع فشل البيلد بسبب تحذيرات Lint (زي unused resources، deprecated APIs)
+              lint {
+                  checkReleaseBuilds = false
+                  abortOnError = false
+              }
+
+              // يمنع "Duplicate class" / "More than one file was found with OS independent path"
+              // وهو خطأ شائع جدًا لما يكون عندك أكتر من مكتبة بتجيب نفس ملفات .so أو META-INF
+              packaging {
+                  resources {
+                      excludes += setOf(
+                          "META-INF/AL2.0",
+                          "META-INF/LGPL2.1",
+                          "META-INF/*.kotlin_module"
+                      )
+                      pickFirsts += setOf(
+                          "**/libc++_shared.so",
+                          "**/libjsc.so"
+                      )
+                  }
+              }
+          }
+
+          dependencies {
+              coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
+              implementation("androidx.multidex:multidex:2.0.1")
+          }
+          EOF
+
+      - name: Unify Android SDK/NDK/JVM across ALL plugin modules (root cause fix)
+        run: |
+          if grep -q 'plugins.withId("com.android.library")' android/build.gradle.kts 2>/dev/null; then
+            echo "Root-level unification already applied (committed android/ folder) - skipping."
+            exit 0
+          fi
+          # المشكلة الجذرية: كل plugin (مكتبة) بيجيله ملف build.gradle خاص بيه،
+          # وممكن يكون متظبط على رقم SDK/NDK/Java قديم أو مختلف عن باقي المشروع.
+          # ده اللي بيسبب أغلب الأخطاء المتكررة (checkReleaseAarMetadata،
+          # Inconsistent JVM target، إلخ) حتى لو إعدادات تطبيقك أنت مظبوطة.
+          #
+          # السطور دي بتوحّد الإعدادات دي على كل المكتبات مرة واحدة،
+          # باستخدام plugins.withId بدل afterEvaluate عشان تشتغل مهما كان
+          # توقيت تقييم كل مشروع فرعي (يتجنب خطأ "already evaluated").
+          cat >> android/build.gradle.kts << 'EOF'
+
+          subprojects {
+              plugins.withId("com.android.library") {
+                  extensions.configure(com.android.build.gradle.LibraryExtension::class.java) {
+                      compileSdk = 36
+                      ndkVersion = "28.2.13676358"
+                  }
+              }
+              plugins.withId("com.android.application") {
+                  extensions.configure(com.android.build.gradle.BaseAppModuleExtension::class.java) {
+                      compileSdk = 36
+                      ndkVersion = "28.2.13676358"
+                  }
+              }
+              plugins.withId("org.jetbrains.kotlin.android") {
+                  extensions.configure(org.jetbrains.kotlin.gradle.dsl.KotlinAndroidProjectExtension::class.java) {
+                      jvmToolchain(17)
+                  }
+              }
+              tasks.withType(JavaCompile::class.java).configureEach {
+                  sourceCompatibility = "17"
+                  targetCompatibility = "17"
+              }
+          }
+          EOF
+
+      - name: Configure AndroidManifest (notifications permissions + receivers + app name)
+        run: |
+          python3 - <<'PY'
+          import re
+          p = 'android/app/src/main/AndroidManifest.xml'
+          m = open(p, encoding='utf-8').read()
+
+          # صلاحيات لازمة للتذكيرات (Android 13+) وإعادة الجدولة بعد الريستارت
+          for perm in ['POST_NOTIFICATIONS', 'RECEIVE_BOOT_COMPLETED', 'VIBRATE', 'WAKE_LOCK']:
+              tag = 'android.permission.' + perm
+              if tag not in m:
+                  m = re.sub(r'(<manifest[^>]*>)', r'\1\n    <uses-permission android:name="' + tag + '" />', m, count=1)
+
+          # Receivers بتاعة flutter_local_notifications (من غيرها الإشعارات المجدولة والأزرار مبتشتغلش)
+          if 'ScheduledNotificationReceiver' not in m:
+              receivers = """
+              <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationReceiver" />
+              <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationBootReceiver">
+                  <intent-filter>
+                      <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                      <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>
+                      <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                      <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+                  </intent-filter>
+              </receiver>
+              <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ActionBroadcastReceiver" />"""
+              m = re.sub(r'(<application\b[^>]*>)', lambda x: x.group(1) + receivers, m, count=1)
+
+          # اسم التطبيق تحت الأيقونة
+          m = re.sub(r'android:label="[^"]*"', 'android:label="SAQR GYM"', m, count=1)
+          open(p, 'w', encoding='utf-8').write(m)
+          print(m)
+          PY
+
+      - name: Get packages
+        run: flutter pub get
+
+      # أيقونة التطبيق (من assets/brand) بدل أيقونة Flutter الافتراضية
+      - name: Generate launcher icons
+        run: |
+          # مفيش مجلد ios في الـ CI فبنقفل توليد أيقونات iOS عشان الأداة متفشلش
+          sed -i 's/^  ios: true/  ios: false/' pubspec.yaml
+          dart run flutter_launcher_icons || echo "launcher icons step failed - continuing with default icon"
+
+      - name: Generate Drift code
+        run: dart run build_runner build --delete-conflicting-outputs
+
+      # مايفشلش الـ build بسبب ملاحظات info/warning تجميلية
+      - name: Analyze (non-blocking)
+        run: flutter analyze || true
+
+      - name: Build release APK
+        run: flutter build apk --release
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: saqr-gym-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+
+      # لو فشل أي حاجة تانية، نرفع اللوجز عشان تبصلها بسهولة من غير
+      # ما تدور في الـ Actions tab
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build/**/*.log
+          if-no-files-found: ignore
