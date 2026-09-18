@@ -105,23 +105,16 @@ jobs:
           cat >> android/build.gradle.kts << 'EOF'
 
           subprojects {
-              // AGP 9 (android.newDsl=true) شال الكلاسات القديمة (BaseAppModuleExtension / gradle.LibraryExtension).
-              // البديل الرسمي: finalizeDsl على androidComponents - بيشتغل بعد ما ملف build.gradle
-              // بتاع كل مكتبة يخلص، فالقيم بتاعتنا هي اللي بتكسب (وميحتاجش afterEvaluate).
               plugins.withId("com.android.library") {
-                  extensions.configure(com.android.build.api.variant.LibraryAndroidComponentsExtension::class.java) {
-                      finalizeDsl { ext ->
-                          ext.compileSdk = 36
-                          ext.ndkVersion = "28.2.13676358"
-                      }
+                  extensions.configure(com.android.build.gradle.LibraryExtension::class.java) {
+                      compileSdk = 36
+                      ndkVersion = "28.2.13676358"
                   }
               }
               plugins.withId("com.android.application") {
-                  extensions.configure(com.android.build.api.variant.ApplicationAndroidComponentsExtension::class.java) {
-                      finalizeDsl { ext ->
-                          ext.compileSdk = 36
-                          ext.ndkVersion = "28.2.13676358"
-                      }
+                  extensions.configure(com.android.build.gradle.BaseAppModuleExtension::class.java) {
+                      compileSdk = 36
+                      ndkVersion = "28.2.13676358"
                   }
               }
               plugins.withId("org.jetbrains.kotlin.android") {
